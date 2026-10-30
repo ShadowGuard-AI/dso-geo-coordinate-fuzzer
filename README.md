@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # dso-geo-coordinate-fuzzer
 Adds random noise to latitude and longitude coordinates, creating a circular area of uncertainty around each point. Useful for de-identifying location data without completely removing geographic information. - Focused on Tools for sanitizing and obfuscating sensitive data within text files and structured data formats
 
