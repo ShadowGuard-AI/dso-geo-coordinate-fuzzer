@@ -5,6 +5,7 @@ import logging
 import random
 import math
 import sys
+from pathlib import Path
 import chardet
 
 # Set up basic logging
@@ -21,7 +22,7 @@ def setup_argparse():
     parser.add_argument('--lat_col', type=int, default=0, help='Column index for latitude (0-based, default: 0).')
     parser.add_argument('--lon_col', type=int, default=1, help='Column index for longitude (0-based, default: 1).')
     parser.add_argument('--delimiter', type=str, default=',', help='Delimiter used in the input file (default: comma).')
-    parser.add_argument('--header', action='store_true', help='If the input file contains a header row, skip it.')
+    parser.add_argument('--header', action='store_true', help='If the input file contains a header row, write it to the output unchanged and do not fuzz it.')
     parser.add_argument('--encoding', type=str, default=None, help='Encoding of the input file. If not provided, it will be detected automatically.')
 
     return parser.parse_args()
@@ -62,9 +63,16 @@ def fuzz_coordinate(latitude, longitude, radius):
     new_latitude = latitude + distance * math.sin(angle)
     new_longitude = longitude + distance * math.cos(angle)
 
-    # Clip new lat/lon to acceptable range
-    new_latitude = max(-90, min(90, new_latitude))
-    new_longitude = max(-180, min(180, new_longitude))
+    # Wrap longitude across the antimeridian instead of clipping, so
+    # points do not collect on the plus or minus 180 line.
+    new_longitude = ((new_longitude + 180) % 360) - 180
+
+    # Reflect latitude at the poles instead of clipping, so points do
+    # not collect on the plus or minus 90 line.
+    reflected = (new_latitude + 90) % 360
+    if reflected > 180:
+        reflected = 360 - reflected
+    new_latitude = reflected - 90
 
     return new_latitude, new_longitude
 
@@ -88,6 +96,14 @@ def process_file(input_file, output_file, radius, lat_col, lon_col, delimiter, h
         ValueError: If invalid data is encountered.
     """
 
+    # Refuse in place output before any file is opened, in any spelling
+    # of the same path (same string, ./ alias, or symlink).
+    if Path(input_file).resolve() == Path(output_file).resolve():
+        logging.error("Output file must not be the input file.")
+        raise ValueError("Output file must not be the input file.")
+
+    fuzzed_count = 0
+    dropped_count = 0
     try:
         # Detect encoding if not provided
         if not encoding:
@@ -96,36 +112,47 @@ def process_file(input_file, output_file, radius, lat_col, lon_col, delimiter, h
                 encoding = result['encoding']
                 logging.info(f"Detected encoding: {encoding}")
 
-        with open(input_file, 'r', encoding=encoding) as infile, open(output_file, 'w', encoding=encoding) as outfile:
-            
-            if header:
-                #Skip the header row
-                next(infile)
+        # Read the whole input before opening the output for writing.
+        with open(input_file, 'r', encoding=encoding) as infile:
+            raw_lines = infile.readlines()
 
-            for line_number, line in enumerate(infile, start=1):
-                line = line.strip()
-                if not line:
-                    continue  # Skip empty lines
+        header_line = None
+        if header and raw_lines:
+            header_line = raw_lines.pop(0).strip()
 
-                try:
-                    parts = line.split(delimiter)
-                    if len(parts) <= max(lat_col, lon_col):
-                        logging.warning(f"Skipping line {line_number}: Not enough columns. Columns found: {len(parts)}")
-                        outfile.write(line + '\n')  # Write the original line to the output
-                        continue
+        output_lines = []
+        if header_line is not None:
+            output_lines.append(header_line)
 
-                    latitude = parts[lat_col]
-                    longitude = parts[lon_col]
-                    
-                    new_latitude, new_longitude = fuzz_coordinate(latitude, longitude, radius)
+        for line_number, line in enumerate(raw_lines, start=1):
+            line = line.strip()
+            if not line:
+                continue  # Skip empty lines
 
-                    parts[lat_col] = str(new_latitude)
-                    parts[lon_col] = str(new_longitude)
+            try:
+                parts = line.split(delimiter)
+                if len(parts) <= max(lat_col, lon_col):
+                    logging.warning(f"Dropping line {line_number}: Not enough columns. Columns found: {len(parts)}")
+                    dropped_count += 1
+                    continue
 
-                    outfile.write(delimiter.join(parts) + '\n')
-                except ValueError as e:
-                    logging.error(f"Error processing line {line_number}: {e}")
-                    outfile.write(line + '\n')  # Write the original line to the output
+                latitude = parts[lat_col]
+                longitude = parts[lon_col]
+
+                new_latitude, new_longitude = fuzz_coordinate(latitude, longitude, radius)
+
+                parts[lat_col] = str(new_latitude)
+                parts[lon_col] = str(new_longitude)
+
+                output_lines.append(delimiter.join(parts))
+                fuzzed_count += 1
+            except ValueError as e:
+                logging.error(f"Dropping line {line_number}: {e}")
+                dropped_count += 1
+
+        with open(output_file, 'w', encoding=encoding) as outfile:
+            for out_line in output_lines:
+                outfile.write(out_line + '\n')
 
     except FileNotFoundError:
         logging.error(f"Input file not found: {input_file}")
@@ -137,6 +164,11 @@ def process_file(input_file, output_file, radius, lat_col, lon_col, delimiter, h
         logging.error(f"An unexpected error occurred: {e}")
         raise
 
+    if dropped_count:
+        logging.error(f"Dropped {dropped_count} row(s) that could not be fuzzed.")
+    logging.info(f"Fuzzed {fuzzed_count} row(s).")
+    return fuzzed_count, dropped_count
+
 
 def main():
     """
@@ -144,8 +176,19 @@ def main():
     """
     try:
         args = setup_argparse()
-        process_file(args.input_file, args.output_file, args.radius, args.lat_col, args.lon_col, args.delimiter, args.header, args.encoding)
+        if args.radius <= 0:
+            logging.error("Radius must be greater than 0.")
+            sys.exit(1)
+        fuzzed_count, dropped_count = process_file(args.input_file, args.output_file, args.radius, args.lat_col, args.lon_col, args.delimiter, args.header, args.encoding)
+        if fuzzed_count == 0:
+            logging.error("No rows fuzzed.")
+            sys.exit(1)
+        if dropped_count:
+            logging.error(f"File processed with {dropped_count} dropped row(s).")
+            sys.exit(1)
         logging.info("File processed successfully.")
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"An error occurred: {e}")
         sys.exit(1)
