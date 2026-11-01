@@ -58,6 +58,13 @@ def fuzz_coordinate(latitude, longitude, radius):
     # Generate a random angle and distance within the radius
     angle = 2 * math.pi * random.random()
     distance = radius * math.sqrt(random.random())  # sqrt for uniform distribution within the circle
+    # The circle lives in degrees, not in ground distance. A degree of
+    # longitude covers less ground the further the point sits from the
+    # equator, so the same radius that spreads a point broadly east to
+    # west near the equator barely moves it at high latitudes, while the
+    # north to south spread stays constant. The fuzz is a degree disc
+    # wherever the point is; on the ground it is an ellipse that flattens
+    # toward the poles.
 
     # Calculate the new coordinates
     new_latitude = latitude + distance * math.sin(angle)
@@ -68,7 +75,10 @@ def fuzz_coordinate(latitude, longitude, radius):
     new_longitude = ((new_longitude + 180) % 360) - 180
 
     # Reflect latitude at the poles instead of clipping, so points do
-    # not collect on the plus or minus 90 line.
+    # not collect on the plus or minus 90 line. A true trip over the pole
+    # would also flip the longitude by 180 degrees; this reflection keeps
+    # the longitude as drawn, which is a small distortion accepted to keep
+    # the mapping simple near a boundary few datasets reach.
     reflected = (new_latitude + 90) % 360
     if reflected > 180:
         reflected = 360 - reflected
@@ -116,6 +126,12 @@ def process_file(input_file, output_file, radius, lat_col, lon_col, delimiter, h
         with open(input_file, 'r', encoding=encoding) as infile:
             raw_lines = infile.readlines()
 
+        # The header flag is the only thing that protects a header row.
+        # Without it, a file that has a header feeds that row into the
+        # fuzzer, where it fails the numeric check and is dropped, which
+        # also makes the whole run exit 1 even though every data row was
+        # written fuzzed. The output file existing is not evidence the run
+        # reported success.
         header_line = None
         if header and raw_lines:
             header_line = raw_lines.pop(0).strip()
